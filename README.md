@@ -310,26 +310,55 @@ Returned when a user lacks the necessary role (e.g., `STAFF` attempting to creat
 
 ---
 
-## Architecture & Design Decisions
+## Architecture, Transaction Handling, Security, and Validation Decisions
 
-### 1. Transaction & Atomicity Strategy
-- The prescription creation workflow (`RecordServiceImpl.createRecord`) is marked `@Transactional`.
-- Cascade configuration (`CascadeType.ALL`, `orphanRemoval = true`) ensures that when the parent `Record` entity is persisted, all associated `RecordEntry` items are written within the same database transaction.
-- If any validation or database constraint fails midway, the entire transaction rolls back, preventing orphaned medication entries or incomplete prescriptions.
+### 1. Architecture Decisions
+- **Layered Clean Architecture**: Built using a strict 4-tier separation of concerns:
+  - **Controller Layer** (`RecordController`): Handles HTTP routing, serialization, parameter parsing, and delegating to services.
+  - **Service Layer** (`RecordServiceImpl`): Houses business rules, transaction boundaries, idempotency verification, and DTO mapping.
+  - **Data Access Layer** (`RecordRepository`, `UserRepository`, `ClientRepository`): Spring Data JPA abstractions managing database queries.
+  - **Database Layer**: PostgreSQL versioned through Flyway migration scripts.
+- **Strict DTO Isolation**: Persistence entities (`Record`, `RecordEntry`, `User`, `Client`) are completely encapsulated within the persistence context and never exposed across REST boundaries. This prevents:
+  - Over-posting / mass-assignment vulnerabilities.
+  - Hibernate `LazyInitializationException` during JSON serialization.
+  - Infinite recursion loops caused by bidirectional associations.
+- **Database Versioning with Flyway**: `hibernate.ddl-auto` is set to `validate` rather than `update`. This ensures Flyway remains the single source of truth for schema evolution across development, testing, and production.
 
-### 2. Idempotency Implementation
-- Network timeouts can cause clients to retry requests, resulting in duplicate prescriptions.
-- Clients supply a client-generated UUID in `idempotencyKey`.
-- A check queries `RecordRepository.findByIdempotencyKey(...)` before entity building.
-- Additionally, a database-level `UNIQUE` constraint guarantees zero double-writes under concurrent conditions.
+---
 
-### 3. Clean Separation via DTOs
-- JPA entities (`Record`, `User`, `Client`) are never exposed directly to external clients, protecting database internals and avoiding serialization infinite recursion on bidirectional associations.
-- Distinct DTOs are maintained: `CreateRecordRequest`, `RecordResponse`, `RecordDetailsResponse`, and `RecordEntryResponse`.
+### 2. Transaction Handling Decisions
+- **Aggregate Root Pattern & Cascading**: A prescription record and its medication entries form a unified domain aggregate. By declaring `CascadeType.ALL` and `orphanRemoval = true` on `Record.entries`, persisting the parent `Record` automatically cascades to all child `RecordEntry` items.
+- **Declarative Transaction Boundaries (`@Transactional`)**: The `createRecord` method is wrapped in `@Transactional`. If an exception occurs during client retrieval, entry mapping, or database insertion, the entire database transaction rolls back, guaranteeing zero partial writes or orphaned records.
+- **Bidirectional Consistency**: The helper method `record.addEntry(entry)` keeps both sides of the Java object graph synchronized (`record.getEntries().add(entry)` and `entry.setRecord(record)`), preventing persistence errors before flushing to the database.
 
-### 4. Schema Versioning vs Schema Auto-Generation
-- `hibernate.ddl-auto` is set to `validate`. Hibernate validates entity models against the live schema on startup.
-- Flyway serves as the single source of truth for all schema modifications, ensuring zero unvetted schema mutations in production.
+---
+
+### 3. Security Decisions
+- **Role-Based Access Control (RBAC)**: Enforces the principle of least privilege:
+  - Creating prescriptions (`POST /api/v1/records`) is restricted to verified medical practitioners with `ROLE_DOCTOR` or `ROLE_ADMIN`.
+  - Receptionists/assistants (`ROLE_STAFF`) can view prescription records but receive a `403 Forbidden` if attempting to create them.
+- **Stateless REST Security**: CSRF protection is disabled (`csrf.disable()`) because the API is stateless and does not use browser session cookies.
+- **Credential Hygiene**: Production credentials and database URLs are externalized via environment variables (`SPRING_DATASOURCE_PASSWORD`, etc.) with safe defaults, preventing credential leakage in public repositories.
+
+---
+
+### 4. Validation & Error Handling Decisions
+- **Fail-Fast Bean Validation**: Incoming payloads are validated at the controller threshold using Jakarta Bean Validation (`@Valid`, `@NotNull`, `@NotBlank`, `@Min`, `@FutureOrPresent`). Requests with missing fields, negative dosages, or past dates are rejected before executing business logic.
+- **Idempotency Strategy**: To protect against duplicate submissions resulting from network timeouts or aggressive client retries:
+  - Clients provide a unique `idempotencyKey` with each request.
+  - The service layer performs an initial existence lookup (`findByIdempotencyKey`).
+  - A database-level `UNIQUE` index acts as a safety barrier against race conditions, rejecting concurrent identical submissions with a `409 Conflict`.
+- **Centralized Exception Handling**: `GlobalExceptionHandler` (`@RestControllerAdvice`) intercepts all runtime exceptions and converts them into uniform, machine-readable JSON envelopes. Internal stack traces and SQL dialect details are never exposed to clients, mitigating information disclosure risks.
+
+---
+
+### 5. Key Design Trade-offs
+- **Client-Provided Idempotency Key vs. Two-Phase Token Handshake**:
+  - *Trade-off*: Requiring clients to submit an idempotency key (UUID) avoids the latency and server-side state of a pre-flight token endpoint (e.g., Redis-based token issuance), while fully preventing duplicate records.
+- **Cascade Persistence vs. Independent Entry Service**:
+  - *Trade-off*: Treating entries as dependent child entities of `Record` simplifies API usage (single request creates record + all medications) at the cost of requiring full prescription payloads for updates. This aligns with standard medical workflows where a prescription is issued as an immutable snapshot.
+- **DTO Mapping vs. Direct Entity Returns**:
+  - *Trade-off*: Writing mapping logic introduces minor boilerplate, but eliminates circular reference bugs, protects entity state, and gives complete control over the external JSON contract.
 
 ---
 
